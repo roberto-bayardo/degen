@@ -133,6 +133,7 @@ var (
 	from                 common.Address // the account owner (sender of the bootstrap tx)
 	tokenID              []byte         // the tokenID of the user's UniswapV3 position
 	compoundingThreshold float64
+	printPositionStats   bool = true
 )
 
 func init() {
@@ -215,8 +216,8 @@ func main() {
 	}
 
 	fmt.Printf("\n================= Starting DEGEN/WETH Autocompounding =================\n")
-	fmt.Printf("     Account address       : %x\n", from)
-	fmt.Printf("     Compounding threshold : %.5g ETH\n", compoundingThreshold)
+	fmt.Printf("  Account address       : %x\n", from)
+	fmt.Printf("  Compounding threshold : %.5g ETH\n", compoundingThreshold)
 
 	for {
 		err := loop()
@@ -332,7 +333,7 @@ func printStats(ethBalance, degenBalance, ethOwed, degenOwed, degenValue float64
 	fmt.Printf("  Wallet balances:\n")
 	fmt.Printf("    DEGEN %9.f\n", degenBalance)
 	fmt.Printf("    ETH   %9.5f\n", ethBalance)
-	fmt.Printf("  Uncollected fees:\n")
+	fmt.Printf("  Unclaimed fees:\n")
 	fmt.Printf("    DEGEN %9.f\n", degenOwed)
 	fmt.Printf("    ETH   %9.5f\n", ethOwed)
 }
@@ -474,22 +475,33 @@ func getOwed(tokenID []byte) (*big.Int, *big.Int, *big.Float, float64, error) {
 	ratio.Quo(ratio, new(big.Float).SetInt(q96))
 	price, _ := ratio.Float64()
 	ratio.Mul(ratio, ratio)
+	fRatio, _ := ratio.Float64()
 
 	lowerPrice := math.Sqrt(math.Pow(1.0001, float64(lowerTick)))
 	upperPrice := math.Sqrt(math.Pow(1.0001, float64(upperTick)))
-	fRatio, _ := ratio.Float64()
 	// TODO: handle out of range
 	ethPortion := fRatio * (upperPrice - price) / (price * upperPrice)
 	degenPortion := (price - lowerPrice)
 	total := ethPortion + degenPortion
 
-	//fmt.Printf("Position range=(%d, %d), current: %d\n", lowerTick, upperTick, currentTick)
 	degenFraction := degenPortion / total
 
 	if currentTick < upperTick && currentTick >= lowerTick {
 		//fmt.Println("Your position is in range!")
 	} else {
 		return nil, nil, nil, 0.0, fmt.Errorf("can't handle out of range position (yet)")
+	}
+	if printPositionStats {
+		liq := toHuman(liquidity)
+		degenVal := degenPortion * liq
+		totalVal := degenVal / degenFraction
+		fmt.Printf("\nPosition stats:\n")
+		fmt.Printf("  Total value: %.5f ETH\n", totalVal/fRatio)
+		fmt.Printf("  Range: (%d, [current: %d], %d)\n", lowerTick, currentTick, upperTick)
+		fmt.Printf("  Portion in DEGEN: %.f%%\n", degenFraction*100.)
+		fmt.Printf("  DEGEN in pool:\n")
+		fmt.Printf("    Amount: %9.f DEGEN\n", degenVal)
+		fmt.Printf("    Value : %9.5f ETH\n", degenVal/fRatio)
 	}
 
 	// fetch stats needed to compute collectable fees based on:
