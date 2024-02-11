@@ -221,7 +221,7 @@ func main() {
 
 	for {
 		err := loop()
-		fmt.Printf("Unexpected failure: %w", err)
+		fmt.Println("\nUnexpected failure:", err)
 		fmt.Println("Sleeping for one minute before restarting.")
 		time.Sleep(sleepDuration * time.Second)
 	}
