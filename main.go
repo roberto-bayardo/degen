@@ -257,8 +257,11 @@ func loop() error {
 					return fmt.Errorf("failed to send collect tx: %w", err)
 				}
 			} else {
-				fmt.Println("\nCompounding....")
 				calldata, ethToSend := getIncreaseLiquidityCall(tokenID, degenBalance, degenPerEth, degenFraction)
+				if toHuman(ethToSend) > (prettyEthBalance - minEthBalance) {
+					return fmt.Errorf("Not enough ETH balance to compound available DEGEN. Please add more ETH to your wallet.")
+				}
+				fmt.Println("\nCompounding....")
 				if err := sendTransaction(positionsAddress, calldata, 500000, ethToSend); err != nil {
 					return fmt.Errorf("failed to send increaseLiquidity tx: %w", err)
 				}
