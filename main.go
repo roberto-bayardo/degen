@@ -1,4 +1,4 @@
-// DEGEN Compoundooooooooooooooooooooooooor!
+// DEGEN Compoundooooooooooooooooooooooooor (and Dollar Cost Averegooooooooor)!!
 //
 // WARNING: THIS SCRIPT CAN AND WILL SPEND YOUR WALLET FUNDS AND PROBABLY HAS BUGS. IN THE WORST
 // CASE IT MIGHT LOSE ALL YOUR FUNDS. FOR EXPERIMENTATION ONLY. USE WITH ONLY A THROWAWAY WALLET
@@ -34,6 +34,9 @@
 // (in ETH) lower than the value of your uninvested DEGEN, or simply send enough DEGEN to your
 // wallet (for example through executing a swap from WETH to DEGEN) to put you over the default
 // threshold.
+//
+// Extra bonus feature: you can also configure the script to dollar cost average ETH into DEGEN at
+// a regular interval with the -dca-amount and -dca-interval flags.
 //
 // TO REITERATE: USE AT YOUR OWN RISK!
 
@@ -74,8 +77,14 @@ const (
 	// Uniswap v3 positions
 	positionsAddressString = "0x03a520b32c04bf3beef7beb72e919cf822ed34f1"
 
-	// Value in ETH of one's uninvested DEGEN that would trigger a compounding
+	// Contract for executing swaps
+	swapAddressString = "0xec8b0f7ffe3ae75d7ffab09429e3675bb63503e4"
+
+	// Default value in ETH of one's uninvested DEGEN that would trigger a compounding
 	defaultCompoundingThreshold = .002 // about $5
+
+	// Default minimum number of seconds bewteen executing swaps for dollar cost averaging
+	defaultDCAInterval = 3600 * 12 // 12 hours
 
 	// Mininum amount of ETH one must hold in the account for script to proceed, to cover tx fees
 	// and such.
@@ -84,35 +93,21 @@ const (
 	// Length of calldata for a call to the Collect() function
 	collectCalldataLen = 644
 
-	// Offsets of various parameters into Collect calldata
-	tokenIDOffset     = 200
-	recipientOffset1  = 424 + 12 // + 12 because we only write last 20 of 32 bytes
-	recipientOffset2  = 584 + 12
-	ethAmountOffset   = 392
-	degenAmountOffset = 552
-
 	// Length of calldata for a call to the increaseLiquidity() function
 	increaseLiquidityCalldataLen = 452
 
-	// Offsets of various parameters into the increaseLiquidity calldata
-	tokenIDLiquidityOffset = 168
-	ethDesiredOffset       = 200
-	degenDesiredOffset     = 232
-	ethMinOffset           = 264
-	degenMinOffset         = 296
-	deadlineOffset         = 328
+	// Length of calldata for a call to execute() to swap WETH for DEGEN
+	swapCalldataLen = 644
 
 	// How long (in seconds) to sleep before polling wallet & positing stats again
 	sleepDuration = 30
 )
 
-// globals
 var (
-	ctx               context.Context
-	client            *ethclient.Client
 	degenPoolAddress  common.Address
 	degenTokenAddress common.Address
 	positionsAddress  common.Address
+	swapAddress       common.Address
 
 	//go:embed collect.txt
 	collectCalldataHex string
@@ -122,84 +117,86 @@ var (
 	increaseLiquidityCalldataHex string
 	increaseLiquidityCalldata    []byte
 
+	//go:embed swap.txt
+	swapCalldataHex string
+	swapCalldata    []byte
+
 	// Fee cap to use for the on-chain transactions. We set this to 1 gwei, as if it gets higher
 	// than this then we probably want to wait for it to come back down. This will keep us from
 	// blowing too much eth on tx fees.
 	gasFeeCap = big.NewInt(1e9 * params.Wei)
 	chainID   = big.NewInt(8453)
 
-	signWith signer.Signer
-
-	from                 common.Address // the account owner (sender of the bootstrap tx)
-	tokenID              []byte         // the tokenID of the user's UniswapV3 position
-	compoundingThreshold float64
-	printPositionStats   bool = true
+	decimals = new(big.Float).SetInt(big.NewInt(1e18))
 )
 
 func init() {
-	log.Default().SetFlags(0)
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	degenPoolAddress = common.HexToAddress(degenPoolAddressString)
 	degenTokenAddress = common.HexToAddress(degenTokenAddressString)
 	positionsAddress = common.HexToAddress(positionsAddressString)
+	swapAddress = common.HexToAddress(swapAddressString)
 
-	var err error
-	collectCalldata, err = hex.DecodeString(strings.TrimSpace(collectCalldataHex))
-	if err != nil {
-		log.Fatalln("couldn't initialize collect tx calldata:", err)
-	}
-	if len(collectCalldata) != collectCalldataLen {
-		log.Fatalln("collect calldata from file embed is wrong length:", len(collectCalldata))
+	parseCalldata := func(s string, expectedLen int) []byte {
+		calldata, err := hex.DecodeString(strings.TrimSpace(s))
+		if err != nil {
+			log.Fatalln("Couldn't initialize tx calldata:", err)
+		}
+		if len(calldata) != expectedLen {
+			log.Fatalln("Calldata from embed is wrong length. Expected:", expectedLen, "Got:", len(calldata))
+		}
+		return calldata
 	}
 
-	increaseLiquidityCalldata, err = hex.DecodeString(strings.TrimSpace(increaseLiquidityCalldataHex))
-	if err != nil {
-		log.Fatalln("couldn't initialize increaseLiquidity tx calldata:", err)
-	}
-	if len(increaseLiquidityCalldata) != increaseLiquidityCalldataLen {
-		log.Fatalln("increaseLiquidity calldata from file embed is wrong length:", len(increaseLiquidityCalldata))
-	}
+	collectCalldata = parseCalldata(collectCalldataHex, collectCalldataLen)
+	increaseLiquidityCalldata = parseCalldata(increaseLiquidityCalldataHex, increaseLiquidityCalldataLen)
+	swapCalldata = parseCalldata(swapCalldataHex, swapCalldataLen)
 }
+
+// globals
+var (
+	ctx    context.Context
+	client *ethclient.Client
+
+	signWith             signer.Signer  // signer initialized with the user-provided key or mnemonic
+	from                 common.Address // the account owner (sender of the bootstrap tx)
+	tokenID              []byte         // the tokenID of the user's UniswapV3 position
+	compoundingThreshold float64        // value in ETH of one's uninvested DEGEN that would trigger a compounding
+	dcaAmount            float64        // amount of ETH to swap with each DCA
+	dcaInterval          int64          // minimum amount of time between DCA swaps
+	dcaTime              int64          // next (unix) time at which to execute a DCA swap
+)
 
 func main() {
 	var l2RPCEndpoint string
 	var privateKey string
-	var ledger bool
 	var mnemonic string
 	var hdPath string
 	var txid string
 
 	flag.StringVar(&txid, "txid", "", "0x hex ID of a previous fee collection transaction against your position")
 	flag.StringVar(&privateKey, "private-key", "", "Private key to use for signing transactions")
-	flag.BoolVar(&ledger, "ledger", false, "Use ledger device for signing transactions")
 	flag.StringVar(&mnemonic, "mnemonic", "", "Mnemonic to use for signing transactions")
-	flag.StringVar(&hdPath, "hd-path", "m/44'/60'/0'/0/0", "Hierarchical deterministic derivation path for mnemonic or ledger")
+	flag.StringVar(&hdPath, "hd-path", "m/44'/60'/0'/0/0", "Hierarchical deterministic derivation path for mnemonic")
 	flag.StringVar(&l2RPCEndpoint, "l2-rpc", defaultL2RPCEndpoint, "L2 RPC endpoint url")
 	flag.Float64Var(&compoundingThreshold, "threshold", defaultCompoundingThreshold, "threshold (in ETH) on value of uninvested DEGEN to trigger compounding")
+	flag.Float64Var(&dcaAmount, "dca-amount", 0.0, "amount of ETH to dollar cost average into the position")
+	flag.Int64Var(&dcaInterval, "dca-interval", defaultDCAInterval, "seconds between each dollar cost average swap")
 	flag.Parse()
 
 	if txid == "" {
 		log.Fatalln("You must specify a -txid of a previous fee collection transaction for your position")
 	}
-
-	options := 0
-	if privateKey != "" {
-		options++
+	if privateKey == "" && mnemonic == "" {
+		log.Fatalln("One (and only one) of -private-key, -mnemonic must be set")
 	}
-	if ledger {
-		options++
-	}
-	if mnemonic != "" {
-		options++
-	}
-	if options != 1 {
-		log.Fatalln("One (and only one) of -private-key, -ledger, -mnemonic must be set")
-	}
-
+	dcaTime = time.Now().Unix() + dcaInterval
 	var err error
 	signWith, err = signer.CreateSigner(privateKey, mnemonic, hdPath)
 	if err != nil {
 		log.Fatalln("error creating signer:", err)
 	}
+
 	ctx = context.Background()
 	client, err = ethclient.DialContext(ctx, l2RPCEndpoint)
 	if err != nil {
@@ -223,7 +220,7 @@ func main() {
 		err := loop()
 		fmt.Println("\nUnexpected failure:", err)
 		fmt.Println("Sleeping for one minute before restarting.")
-		time.Sleep(sleepDuration * time.Second)
+		time.Sleep(60 * time.Second)
 	}
 }
 
@@ -251,78 +248,36 @@ func loop() error {
 		}
 
 		if prettyDegenValue >= compoundingThreshold {
-			fmt.Printf("Compounding threshold met! value=%.5g, threshold=%.5g\n", prettyDegenValue, compoundingThreshold)
+			fmt.Printf("\nCompounding threshold met! value=%.5g, threshold=%.5g\n", prettyDegenValue, compoundingThreshold)
 			// Don't collect fees if the vast majority of the degen balance is already part of the wallet balance.
 			if toHuman(degenOwed) > 100 {
 				fmt.Println("\nCollecting owed fees....")
-				calldata := make([]byte, len(collectCalldata))
-				copy(calldata, collectCalldata)
-
-				// Populate the position's tokenID
-				copy(calldata[tokenIDOffset:], tokenID)
-
-				// Populate the receiver address
-				copy(calldata[recipientOffset1:], from[:])
-				copy(calldata[recipientOffset2:], from[:])
-
-				// Populate the amounts
-				copy(calldata[ethAmountOffset:], bigToArg(ethOwed))
-				copy(calldata[degenAmountOffset:], bigToArg(degenOwed))
-
-				err := sendTransaction(positionsAddress, calldata, 300000, new(big.Int))
-				if err == ethereum.NotFound {
-					// Couldn't find receipt, pretend nothing happened
-					time.Sleep(sleepDuration * time.Second)
-					continue
-				}
-				if err != nil {
+				calldata := getCollectCall(tokenID, ethOwed, degenOwed)
+				if err := sendTransaction(positionsAddress, calldata, 300000, new(big.Int)); err != nil {
 					return fmt.Errorf("failed to send collect tx: %w", err)
 				}
 			} else {
-				// compound the amount!
 				fmt.Println("\nCompounding....")
-				calldata := make([]byte, len(increaseLiquidityCalldata))
-				copy(calldata, increaseLiquidityCalldata)
-
-				// Populate the position's tokenID
-				copy(calldata[tokenIDLiquidityOffset:], tokenID)
-
-				// Populate the desired amounts
-				f := new(big.Float).SetInt(degenBalance)
-				f.Quo(f, big.NewFloat(degenFraction)) // full 1.0 amount
-				f.Sub(f, new(big.Float).SetInt(degenBalance))
-				f.Quo(f, degenPerEth)
-				ethToSend, _ := f.Int(nil)
-				fmt.Println("DEGEN to send:", toHuman(degenBalance))
-				fmt.Println("ETH to send  :", fToHuman(f))
-				copy(calldata[degenDesiredOffset:], bigToArg(degenBalance))
-				copy(calldata[ethDesiredOffset:], bigToArg(ethToSend))
-
-				// Populate the min amounts (desired * .005)
-				dec := new(big.Int)
-				dec.Div(degenBalance, big.NewInt(200)) // .5% of original value
-				dec.Sub(degenBalance, dec)
-				copy(calldata[degenMinOffset:], bigToArg(dec))
-				dec.Div(ethToSend, big.NewInt(200))
-				dec.Sub(ethToSend, dec)
-				copy(calldata[ethMinOffset:], bigToArg(dec))
-
-				// Populate deadline
-				now := time.Now()
-				deadline := int(now.Unix()) + 60
-				copy(calldata[deadlineOffset:], intToArg(deadline))
-
-				err := sendTransaction(positionsAddress, calldata, 500000, ethToSend)
-				if err == ethereum.NotFound {
-					// Couldn't find receipt, pretend nothing happened
-					time.Sleep(sleepDuration * time.Second)
-					continue
-				}
-				if err != nil {
+				calldata, ethToSend := getIncreaseLiquidityCall(tokenID, degenBalance, degenPerEth, degenFraction)
+				if err := sendTransaction(positionsAddress, calldata, 500000, ethToSend); err != nil {
 					return fmt.Errorf("failed to send increaseLiquidity tx: %w", err)
 				}
 			}
+			time.Sleep(sleepDuration * time.Second)
+			continue
 		}
+
+		if shouldDCA(prettyEthBalance) {
+			fmt.Println("\nDollar cost averaging....")
+			calldata, ethToSend := getSwapCall(degenPerEth)
+			if err := sendTransaction(swapAddress, calldata, 500000, ethToSend); err != nil {
+				return fmt.Errorf("failed to send increaseLiquidity tx: %w", err)
+			}
+			dcaTime = time.Now().Unix() + dcaInterval
+			time.Sleep(sleepDuration * time.Second)
+			continue
+		}
+
 		time.Sleep(sleepDuration * time.Second)
 	} // for
 }
@@ -338,7 +293,124 @@ func printStats(ethBalance, degenBalance, ethOwed, degenOwed, degenValue float64
 	fmt.Printf("    ETH   %9.5f\n", ethOwed)
 }
 
-var decimals = new(big.Float).SetInt(big.NewInt(1e18))
+func shouldDCA(ethBalance float64) bool {
+	if dcaAmount == 0.0 {
+		return false
+	}
+	now := time.Now().Unix()
+	if now < dcaTime {
+		fmt.Printf("\nTime to next DCA swap: %s\n", time.Duration(dcaTime-now)*time.Second)
+		return false
+	}
+	if dcaAmount > (ethBalance - minEthBalance) {
+		fmt.Printf("\nTime to next DCA swap: OVERDUE. Not enough ETH balance to swap.\n")
+		return false
+	}
+	return true
+}
+
+func getSwapCall(degenPerEth *big.Float) ([]byte, *big.Int) {
+	const (
+		deadlineOffset          = 68
+		ethToWrapOffset         = 324
+		ethToSwapOffset         = 420
+		minDegenToReceiveOffset = 452
+	)
+
+	calldata := make([]byte, len(swapCalldata))
+	copy(calldata, swapCalldata)
+
+	bigF := big.NewFloat(dcaAmount)
+	bigF.Mul(bigF, decimals)
+	ethToSend, _ := bigF.Int(nil)
+
+	bigF.Mul(bigF, degenPerEth)
+	frac := big.NewFloat(.997 * .995) // Adjust for .3% fee & .5% slippage
+	bigF.Mul(bigF, frac)
+	minDegenToReceive, _ := bigF.Mul(bigF, frac).Int(nil)
+
+	fmt.Println("ETH to swap         :", toHuman(ethToSend))
+	fmt.Println("min DEGEN to receive:", toHuman(minDegenToReceive))
+
+	now := time.Now()
+	deadline := int(now.Unix()) + 60
+
+	copy(calldata[deadlineOffset:], intToArg(deadline))
+	copy(calldata[ethToSwapOffset:], bigToArg(ethToSend))
+	copy(calldata[ethToWrapOffset:], bigToArg(ethToSend))
+	copy(calldata[minDegenToReceiveOffset:], bigToArg(minDegenToReceive))
+
+	return calldata, ethToSend
+}
+
+func getIncreaseLiquidityCall(tokenID []byte, degenBalance *big.Int, degenPerEth *big.Float, degenFraction float64) ([]byte, *big.Int) {
+	const (
+		tokenIDOffset      = 168
+		ethDesiredOffset   = 200
+		degenDesiredOffset = 232
+		ethMinOffset       = 264
+		degenMinOffset     = 296
+		deadlineOffset     = 328
+	)
+
+	calldata := make([]byte, len(increaseLiquidityCalldata))
+	copy(calldata, increaseLiquidityCalldata)
+
+	// Populate the position's tokenID
+	copy(calldata[tokenIDOffset:], tokenID)
+
+	// Populate the desired amounts
+	f := new(big.Float).SetInt(degenBalance)
+	f.Quo(f, big.NewFloat(degenFraction)) // full 1.0 amount
+	f.Sub(f, new(big.Float).SetInt(degenBalance))
+	f.Quo(f, degenPerEth)
+	ethToSend, _ := f.Int(nil)
+	fmt.Println("DEGEN to send:", toHuman(degenBalance))
+	fmt.Println("ETH to send  :", fToHuman(f))
+	copy(calldata[degenDesiredOffset:], bigToArg(degenBalance))
+	copy(calldata[ethDesiredOffset:], bigToArg(ethToSend))
+
+	// Populate the min amounts (desired * .005)
+	dec := new(big.Int)
+	dec.Div(degenBalance, big.NewInt(200)) // .5% of original value
+	dec.Sub(degenBalance, dec)
+	copy(calldata[degenMinOffset:], bigToArg(dec))
+	dec.Div(ethToSend, big.NewInt(200))
+	dec.Sub(ethToSend, dec)
+	copy(calldata[ethMinOffset:], bigToArg(dec))
+
+	// Populate deadline
+	now := time.Now()
+	deadline := int(now.Unix()) + 60
+	copy(calldata[deadlineOffset:], intToArg(deadline))
+
+	return calldata, ethToSend
+}
+
+func getCollectCall(tokenID []byte, ethOwed, degenOwed *big.Int) []byte {
+	const (
+		tokenIDOffset     = 200
+		recipientOffset1  = 424 + 12 // + 12 because we only write last 20 of 32 bytes
+		recipientOffset2  = 584 + 12
+		ethAmountOffset   = 392
+		degenAmountOffset = 552
+	)
+
+	calldata := make([]byte, len(collectCalldata))
+	copy(calldata, collectCalldata)
+
+	// Populate the position's tokenID
+	copy(calldata[tokenIDOffset:], tokenID)
+
+	// Populate the receiver address
+	copy(calldata[recipientOffset1:], from[:])
+	copy(calldata[recipientOffset2:], from[:])
+
+	// Populate the amounts
+	copy(calldata[ethAmountOffset:], bigToArg(ethOwed))
+	copy(calldata[degenAmountOffset:], bigToArg(degenOwed))
+	return calldata
+}
 
 // convert an 18 decimal token amount to human readable float
 func toHuman(i *big.Int) float64 {
@@ -419,6 +491,9 @@ func callContract(address *common.Address, selector []byte, args []byte, lenResu
 }
 
 func tokenAndSenderFromBootstrapTX(txid string) ([]byte, common.Address, error) {
+	const (
+		tokenIDOffset = 200
+	)
 	hash := common.HexToHash(txid)
 	tx, _, err := client.TransactionByHash(ctx, hash)
 	if err != nil {
@@ -491,18 +566,18 @@ func getOwed(tokenID []byte) (*big.Int, *big.Int, *big.Float, float64, error) {
 	} else {
 		return nil, nil, nil, 0.0, fmt.Errorf("can't handle out of range position (yet)")
 	}
-	if printPositionStats {
-		liq := toHuman(liquidity)
-		degenVal := degenPortion * liq
-		totalVal := degenVal / degenFraction
-		fmt.Printf("\nPosition stats:\n")
-		fmt.Printf("  Total value: %.5f ETH\n", totalVal/fRatio)
-		fmt.Printf("  Range: (%d, [current: %d], %d)\n", lowerTick, currentTick, upperTick)
-		fmt.Printf("  Portion in DEGEN: %.f%%\n", degenFraction*100.)
-		fmt.Printf("  DEGEN in pool:\n")
-		fmt.Printf("    Amount: %9.f DEGEN\n", degenVal)
-		fmt.Printf("    Value : %9.5f ETH\n", degenVal/fRatio)
-	}
+
+	liq := toHuman(liquidity)
+	degenVal := degenPortion * liq
+	totalVal := degenVal / degenFraction
+	fmt.Printf("\n-------------------------------------------------\n")
+	fmt.Printf("Position stats:\n")
+	fmt.Printf("  Total value: %.5f ETH\n", totalVal/fRatio)
+	fmt.Printf("  Range: (%d, [current: %d], %d)\n", lowerTick, currentTick, upperTick)
+	fmt.Printf("  Portion in DEGEN: %.f%%\n", degenFraction*100.)
+	fmt.Printf("  DEGEN in pool:\n")
+	fmt.Printf("    Amount: %9.f DEGEN\n", degenVal)
+	fmt.Printf("    Value : %9.5f ETH\n", degenVal/fRatio)
 
 	// fetch stats needed to compute collectable fees based on:
 	// https://blog.uniswap.org/uniswap-v3-math-primer-2
@@ -571,7 +646,7 @@ func sendTransaction(address common.Address, calldata []byte, gasLimit uint64, v
 	txMessage := &types.DynamicFeeTx{
 		ChainID:   chainID,
 		Nonce:     nonce,
-		To:        &positionsAddress,
+		To:        &address,
 		GasTipCap: gasprice.DefaultMinSuggestedPriorityFee,
 		GasFeeCap: gasFeeCap,
 		Gas:       gasLimit,
@@ -602,8 +677,11 @@ func sendTransaction(address common.Address, calldata []byte, gasLimit uint64, v
 			return fmt.Errorf("error waiting for receipt: %w", err)
 		}
 		fmt.Println("Got receipt. Status:", r.Status)
+		if r.Status == 0 {
+			return fmt.Errorf("transaction failed (receipt status: 0)")
+		}
 		return nil
 	}
 	fmt.Println("Giving up waiting for receipt.")
-	return ethereum.NotFound
+	return nil
 }
