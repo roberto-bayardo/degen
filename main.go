@@ -213,8 +213,15 @@ func main() {
 	}
 
 	fmt.Printf("\n================= Starting DEGEN/WETH Autocompounding =================\n")
+	fmt.Println()
 	fmt.Printf("  Account address       : %x\n", from)
 	fmt.Printf("  Compounding threshold : %.5g ETH\n", compoundingThreshold)
+	if dcaAmount > 0.0 {
+		fmt.Printf("\n================= Starting DEGEN Dollar Cost Averaging ================\n")
+		fmt.Println()
+		fmt.Printf("  Dollar cost averaging amount  : %.5g ETH\n", dcaAmount)
+		fmt.Printf("  Dollar cost averaging interval: %v\n", time.Duration(dcaInterval)*time.Second)
+	}
 
 	for {
 		err := loop()
