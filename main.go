@@ -78,7 +78,8 @@ const (
 	positionsAddressString = "0x03a520b32c04bf3beef7beb72e919cf822ed34f1"
 
 	// Contract for executing swaps
-	swapAddressString = "0xec8b0f7ffe3ae75d7ffab09429e3675bb63503e4"
+	swapAddressString        = "0xec8b0f7ffe3ae75d7ffab09429e3675bb63503e4"
+	reverseSwapAddressString = "0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD"
 
 	// Default value in ETH of one's uninvested DEGEN that would trigger a compounding
 	defaultCompoundingThreshold = .002 // about $5
@@ -97,17 +98,19 @@ const (
 	increaseLiquidityCalldataLen = 452
 
 	// Length of calldata for a call to execute() to swap WETH for DEGEN
-	swapCalldataLen = 644
+	swapCalldataLen        = 644
+	reverseSwapCalldataLen = 644
 
 	// How long (in seconds) to sleep before polling wallet & positing stats again
 	sleepDuration = 30
 )
 
 var (
-	degenPoolAddress  common.Address
-	degenTokenAddress common.Address
-	positionsAddress  common.Address
-	swapAddress       common.Address
+	degenPoolAddress   common.Address
+	degenTokenAddress  common.Address
+	positionsAddress   common.Address
+	swapAddress        common.Address
+	reverseSwapAddress common.Address
 
 	//go:embed collect.txt
 	collectCalldataHex string
@@ -120,11 +123,14 @@ var (
 	//go:embed swap.txt
 	swapCalldataHex string
 	swapCalldata    []byte
+	//go:embed reverseSwap.txt
+	reverseSwapCalldataHex string
+	reverseSwapCalldata    []byte
 
 	// Fee cap to use for the on-chain transactions. We set this to 1 gwei, as if it gets higher
 	// than this then we probably want to wait for it to come back down. This will keep us from
 	// blowing too much eth on tx fees.
-	gasFeeCap = big.NewInt(1e9 * params.Wei)
+	gasFeeCap = big.NewInt(2e9 * params.Wei)
 	chainID   = big.NewInt(8453)
 
 	decimals = new(big.Float).SetInt(big.NewInt(1e18))
@@ -136,6 +142,7 @@ func init() {
 	degenTokenAddress = common.HexToAddress(degenTokenAddressString)
 	positionsAddress = common.HexToAddress(positionsAddressString)
 	swapAddress = common.HexToAddress(swapAddressString)
+	reverseSwapAddress = common.HexToAddress(reverseSwapAddressString)
 
 	parseCalldata := func(s string, expectedLen int) []byte {
 		calldata, err := hex.DecodeString(strings.TrimSpace(s))
@@ -151,6 +158,7 @@ func init() {
 	collectCalldata = parseCalldata(collectCalldataHex, collectCalldataLen)
 	increaseLiquidityCalldata = parseCalldata(increaseLiquidityCalldataHex, increaseLiquidityCalldataLen)
 	swapCalldata = parseCalldata(swapCalldataHex, swapCalldataLen)
+	reverseSwapCalldata = parseCalldata(reverseSwapCalldataHex, reverseSwapCalldataLen)
 }
 
 // globals
@@ -274,7 +282,7 @@ func loop() error {
 			fmt.Println("\nDollar cost averaging....")
 			calldata, ethToSend := getSwapCall(degenPerEth)
 			if err := sendTransaction(swapAddress, calldata, 500000, ethToSend); err != nil {
-				return fmt.Errorf("failed to send increaseLiquidity tx: %w", err)
+				return fmt.Errorf("failed to send swap tx: %w", err)
 			}
 			dcaTime = time.Now().Unix() + dcaInterval
 			time.Sleep(sleepDuration * time.Second)
@@ -344,6 +352,42 @@ func getSwapCall(degenPerEth *big.Float) ([]byte, *big.Int) {
 	copy(calldata[minDegenToReceiveOffset:], bigToArg(minDegenToReceive))
 
 	return calldata, ethToSend
+}
+
+func getReverseSwapCall(degenPerEth *big.Float) ([]byte, *big.Int) {
+	const (
+		deadlineOffset        = 68
+		degenToSwapOffset     = 324
+		minEthToReceiveOffset = 356
+		minEthToWrapOffset    = 612
+	)
+
+	calldata := make([]byte, len(reverseSwapCalldata))
+	copy(calldata, reverseSwapCalldata)
+
+	ethToReceive := big.NewFloat(dcaAmount)
+	ethToReceive.Mul(ethToReceive, decimals)
+
+	degenToSendF := new(big.Float)
+	degenToSendF.Mul(ethToReceive, degenPerEth)
+	degenToSend, _ := degenToSendF.Int(nil)
+
+	frac := big.NewFloat(.997 * .995) // Adjust for .3% fee & .5% slippage
+	ethToReceive.Mul(ethToReceive, frac)
+	minEthToReceive, _ := ethToReceive.Int(nil)
+
+	fmt.Println("DEGEN to swap         :", toHuman(degenToSend))
+	fmt.Println("min ETH to receive:", toHuman(minEthToReceive))
+
+	now := time.Now()
+	deadline := int(now.Unix()) + 60
+
+	copy(calldata[deadlineOffset:], intToArg(deadline))
+	copy(calldata[degenToSwapOffset:], bigToArg(degenToSend))
+	copy(calldata[minEthToReceiveOffset:], bigToArg(minEthToReceive))
+	copy(calldata[minEthToWrapOffset:], bigToArg(minEthToReceive))
+
+	return calldata, degenToSend
 }
 
 func getIncreaseLiquidityCall(tokenID []byte, degenBalance *big.Int, degenPerEth *big.Float, degenFraction float64) ([]byte, *big.Int) {
@@ -421,10 +465,11 @@ func toHuman(i *big.Int) float64 {
 	return fToHuman(fBig)
 }
 
-func fToHuman(fBig *big.Float) float64 {
+func fToHuman(f *big.Float) float64 {
+	fBig := new(big.Float).Set(f)
 	fBig.Quo(fBig, decimals)
-	f, _ := fBig.Float64()
-	return f
+	r, _ := fBig.Float64()
+	return r
 }
 
 func subIn256(x, y *big.Int) *big.Int {
